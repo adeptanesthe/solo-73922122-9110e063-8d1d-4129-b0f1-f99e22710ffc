@@ -1,0 +1,41 @@
+id,title,abstract
+E001,Network pruning (ML),Ensemble methods for neural network pruning.
+E002,Autonomous memory tracking (QEC),A logical qubit memory with autonomous syndrome tracking.
+E003,Guide design study (CRISPR),CRISPR Cas9 guide RNA design for precise gene editing.
+E004,Aerosol constraints (CLIMATE),Satellite constraints on climate model aerosols.
+E005,Molecular property prediction (ML),Graph neural network models for molecular property prediction.
+E006,Rainfall projections (CLIMATE),Climate model ensembles project regional rainfall changes.
+E007,Array protection study (QEC),A surface code protects each logical qubit against decoherence.
+E008,In vivo delivery (CRISPR),Delivery vectors for in vivo CRISPR therapeutics.
+E009,Measurement stream classification (ML),A neural syndrome classifier for surface code measurement streams.
+E010,Pretraining for graphs (ML),Self supervised pretraining for graph neural models.
+E011,Extraction circuit design (QEC),Syndrome extraction circuits for stabilizer code readout.
+E012,Graph structured decoding (ML),A neural network decoder for graph structured data.
+E013,Thresholds of code architectures (QEC),Quantum error correction thresholds for surface code architectures.
+E014,Correlated noise channels (QEC),Correlated decoherence channels limit the achievable code distance.
+E015,Nickase fusion editing (CRISPR),Base editing with CRISPR nickase fusion proteins.
+E016,Small dataset benchmarks (ML),Benchmarking deep neural networks on small chemical datasets.
+E017,Attention generalization (ML),Attention layers improve neural network generalization.
+E018,Round scheduling (QEC),Stabilizer round scheduling lowers logical failure rates.
+E019,Cloud feedback study (CLIMATE),Cloud feedback uncertainty in climate models.
+E020,Rotated layout measurement (QEC),Fault tolerant stabilizer measurement on a rotated surface code.
+E021,Survey of protection schemes (QEC),We survey quantum error correction schemes for fault tolerant devices.
+E022,Protein structure networks (ML),Convolution networks for protein structure prediction.
+E023,Graph kernel baselines (ML),Graph kernel baselines for molecule classification.
+E024,Emulated decoding (ML),Graph networks emulate surface code decoding under syndrome noise.
+E025,Coherence time extension (QEC),Decoherence mitigation extends logical qubit coherence time.
+E026,Off target measurement (CRISPR),Off target effects in CRISPR screening experiments.
+E027,Real time decoding (QEC),Real time syndrome decoding for superconducting qubits.
+E028,Hardware efficient checks (QEC),Hardware efficient quantum error correction using syndrome measurement.
+E029,Biased noise encoding (QEC),Quantum error correction with biased noise stabilizer codes.
+E030,Weight sharing search (ML),Neural architecture search with weight sharing.
+E031,Benchmarks for encoded processors (QEC),Quantum error correction benchmarks for superconducting qubit arrays.
+E032,Emulator projections (CLIMATE),Emulator based climate projections at century scale.
+E033,Prime toolbox (CRISPR),Prime editing expands the CRISPR toolbox.
+E034,Reaction prediction (ML),Transformer models for chemical reaction prediction.
+E035,Overhead in near term devices (QEC),Quantum error correction overhead in near term quantum processors.
+E036,Sea temperature trends (CLIMATE),Sea surface temperature trends in climate simulations.
+E037,Lattice surgery operations (QEC),Surface code lattice surgery enables logical qubit operations.
+E038,Repeated check benchmarking (QEC),Logical qubit benchmarking with repeated syndrome checks.
+E039,Dependency mapping (CRISPR),CRISPR interference reveals cancer dependency genes.
+E040,Flood risk downscaling (CLIMATE),Downscaling climate projections for coastal flood risk assessment.

@@ -113,6 +113,64 @@
         <tbody></tbody>
       </table>
     </section>
+
+    <!-- 5. 新批次评测 -->
+    <section class="card hidden" id="eval-card">
+      <h2>⑤ 新批次评测：扩展词换一批论文还能改善前 K 名吗？</h2>
+      <p class="hint">
+        上传未审摘要 CSV（表头 <code>id,title,abstract</code>，至多 200 篇、编号唯一），选择 K（1～20）。
+        系统沿用原语料拟合的 TF-IDF 与原有命中/排序规则，用当前建议的<b>原查询</b>与<b>扩展后查询</b>
+        在评测集上各取前 K 篇。对每篇论文判「相关 / 不相关」（可更正，两榜共用同一份标注）；
+        未判论文按「可能相关或不相关」精确计算 <b>扩展榜 − 原榜</b> 的 NDCG@K 差值上下界
+        （理想榜按评测全集计算，全集不相关时两榜记 0），并列出达到各端点时应判相关的未判论文。
+        下界 &gt; 0 才判定「确定改善」。
+      </p>
+      <div class="row">
+        <input type="file" id="eval-file-input" accept=".csv,.tsv" />
+        <button id="eval-upload-btn">上传评测集</button>
+        <button id="eval-demo-btn" class="secondary">使用演示评测集</button>
+        <label class="k-label">K（1～20）
+          <input type="number" id="eval-k" min="1" max="20" step="1" value="10" />
+        </label>
+        <button id="eval-compute-btn" class="secondary">重新计算界</button>
+      </div>
+      <div id="eval-status" class="status"></div>
+      <div id="eval-error" class="error hidden"></div>
+
+      <div id="eval-body" class="hidden">
+        <div id="eval-verdict"></div>
+        <div class="metric-grid" id="eval-metrics"></div>
+        <div id="eval-witness"></div>
+
+        <h3>前 K 名对照 <span class="hint" id="eval-lists-meta"></span></h3>
+        <div class="eval-lists">
+          <div class="eval-list-col">
+            <h4 id="eval-list-a-title">原查询 top-K</h4>
+            <table id="eval-list-a">
+              <thead><tr><th>#</th><th>ID</th><th>标题</th><th>判定</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="eval-list-col">
+            <h4 id="eval-list-b-title">扩展查询 top-K</h4>
+            <table id="eval-list-b">
+              <thead><tr><th>#</th><th>ID</th><th>标题</th><th>判定</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <h3>评测集标注 <span class="hint" id="eval-judge-meta"></span></h3>
+        <div id="eval-docs-wrap">
+          <table id="eval-docs-table">
+            <thead>
+              <tr><th>ID</th><th>标题 / 摘要</th><th>当前判定</th><th>操作</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </main>
 
   <footer>

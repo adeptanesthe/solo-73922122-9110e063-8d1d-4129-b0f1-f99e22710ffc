@@ -14,10 +14,18 @@ S4  Revision — exclude terms: solution is recomputed without them and the
     old suggestion id is rejected with HTTP 409.
 S5  Revision — lock a term: it is forced into every new solution.
 S6  Lock/exclude contradiction is rejected; unlock restores feasibility.
+S7  Eval set upload + NDCG@K difference bounds on the demo eval set.
+S8  Bounds exactness: API bounds vs brute-force enumeration on a tiny set.
+S9  Judging narrows the interval; fully judged set collapses to one value.
+S10 Revision invalidates eval conclusions (409) but keeps the annotations.
+S11 Replacing the eval set clears annotations; late calls with the old
+    eval_id are rejected (HTTP 409).
 """
 
 from __future__ import annotations
 
+import itertools
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +38,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 CORPUS_PATH = ROOT / "data" / "demo_corpus.csv"
+EVAL_PATH = ROOT / "data" / "demo_eval.csv"
 REPORT_DIR = ROOT / "reports"
 
 client = TestClient(app)
@@ -66,6 +75,54 @@ def analyze(sid: str, **overrides) -> dict:
     resp = client.post("/api/analyze", json=body)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# eval helpers
+# --------------------------------------------------------------------------- #
+def upload_eval(sid: str, raw: bytes | None = None,
+                name: str = "demo_eval.csv") -> dict:
+    data = raw if raw is not None else EVAL_PATH.read_bytes()
+    resp = client.post(f"/api/sessions/{sid}/eval-set",
+                       files={"file": (name, data, "text/csv")})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def eval_compute(sid: str, eval_id: str, suggestion_id: str, k: int = 10):
+    return client.post(f"/api/sessions/{sid}/eval-compute", json={
+        "eval_id": eval_id, "suggestion_id": suggestion_id, "k": k,
+    })
+
+
+def eval_judge(sid: str, eval_id: str, doc_id: str, relevant):
+    return client.post(f"/api/sessions/{sid}/eval-judge", json={
+        "eval_id": eval_id, "doc_id": doc_id, "relevant": relevant,
+    })
+
+
+def _w(rank: int) -> float:
+    return 1.0 / math.log2(rank + 1)
+
+
+def brute_force_delta_bounds(doc_ids, judgments, list_a, list_b, k):
+    """Enumerate all 2^U labellings (only feasible for tiny eval sets)."""
+    unjudged = [d for d in doc_ids if d not in judgments]
+    lo, hi = math.inf, -math.inf
+    for bits in range(2 ** len(unjudged)):
+        labels = dict(judgments)
+        for i, d in enumerate(unjudged):
+            labels[d] = bool(bits >> i & 1)
+        r = sum(1 for v in labels.values() if v)
+        if r == 0:
+            delta = 0.0
+        else:
+            idcg = sum(_w(i) for i in range(1, min(r, k) + 1))
+            dcg_a = sum(_w(i + 1) for i, d in enumerate(list_a) if labels[d])
+            dcg_b = sum(_w(i + 1) for i, d in enumerate(list_b) if labels[d])
+            delta = dcg_b / idcg - dcg_a / idcg
+        lo, hi = min(lo, delta), max(hi, delta)
+    return lo, hi
 
 
 def main() -> int:
@@ -224,7 +281,152 @@ def main() -> int:
         payload={"conflict": conflict.json(), "unlock": unlock.json()},
     )
 
-    write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures)
+    # --------------------------------------------------------------- S7
+    # 评测：演示评测集上传 + NDCG@K 差值界计算
+    sid3 = upload_demo()
+    a3 = analyze(sid3)
+    ev = upload_eval(sid3)
+    r7 = eval_compute(sid3, ev["eval_id"], a3["suggestion_id"], k=10)
+    assert r7.status_code == 200, r7.text
+    e7 = r7.json()
+    b7 = e7["bounds"]
+    ok = (
+        e7["n_docs"] == 40
+        and len(e7["lists"]["original"]) <= 10
+        and len(e7["lists"]["expanded"]) <= 10
+        and len(e7["lists"]["expanded"]) >= len(e7["lists"]["original"])
+        and b7["lower"] <= e7["tentative"]["delta"] <= b7["upper"]
+        and b7["lower"] <= 0.0 <= b7["upper"]  # 全未判时全不相关补全给出 0
+    )
+    failures += 0 if ok else 1
+    record(
+        "S7 评测集上传与差值界计算（K=10）", ok,
+        f"评测集 {e7['n_docs']} 篇；原榜 {len(e7['lists']['original'])} 篇 / "
+        f"扩展榜 {len(e7['lists']['expanded'])} 篇；"
+        f"差值界=[{b7['lower']:.4f}, {b7['upper']:.4f}]；"
+        f"暂定差值={e7['tentative']['delta']:.4f}；"
+        f"确定改善={b7['certain_improvement']}",
+        payload=e7,
+    )
+
+    # --------------------------------------------------------------- S8
+    # 精确性：小评测集上 API 界与 2^U 穷举完全一致
+    tiny_csv = (
+        "id,title,abstract\n"
+        "t1,x,quantum error correction gates\n"
+        "t2,x,surface code logical qubit\n"
+        "t3,x,syndrome decoherence mitigation\n"
+        "t4,x,quantum error correction circuits\n"
+        "t5,x,neural network layers\n"
+        "t6,x,crispr gene editing\n"
+    ).encode()
+    ev8 = upload_eval(sid3, raw=tiny_csv, name="tiny.csv")
+    eval_judge(sid3, ev8["eval_id"], "t2", True)
+    eval_judge(sid3, ev8["eval_id"], "t5", False)
+    r8 = eval_compute(sid3, ev8["eval_id"], a3["suggestion_id"], k=3)
+    assert r8.status_code == 200, r8.text
+    e8 = r8.json()
+    lo_bf, hi_bf = brute_force_delta_bounds(
+        ["t1", "t2", "t3", "t4", "t5", "t6"],
+        {"t2": True, "t5": False},
+        [r["id"] for r in e8["lists"]["original"]],
+        [r["id"] for r in e8["lists"]["expanded"]],
+        3,
+    )
+    ok = (
+        abs(e8["bounds"]["lower"] - lo_bf) < 1e-6
+        and abs(e8["bounds"]["upper"] - hi_bf) < 1e-6
+    )
+    failures += 0 if ok else 1
+    record(
+        "S8 差值界与 2^U 穷举完全一致（6 篇小集，K=3）", ok,
+        f"API 界=[{e8['bounds']['lower']:.6f}, {e8['bounds']['upper']:.6f}]；"
+        f"穷举界=[{lo_bf:.6f}, {hi_bf:.6f}]",
+        payload=e8,
+    )
+
+    # --------------------------------------------------------------- S9
+    # 标注收窄区间；全部判定后上下界收敛为同一点
+    ev9 = upload_eval(sid3)  # 40 篇演示评测集
+    sug9 = a3["suggestion_id"]
+    for i, doc in enumerate(ev9["docs"]):
+        # 前 12 篇先判：标题含 (QEC) 判相关，否则不相关
+        if i < 12:
+            eval_judge(sid3, ev9["eval_id"], doc["id"],
+                       "(QEC)" in doc["title"])
+    mid = eval_compute(sid3, ev9["eval_id"], sug9, k=10).json()
+    span_before = b7["upper"] - b7["lower"]
+    span_mid = mid["bounds"]["upper"] - mid["bounds"]["lower"]
+    for doc in ev9["docs"]:
+        if eval_judge(sid3, ev9["eval_id"], doc["id"],
+                      "(QEC)" in doc["title"]).status_code != 200:
+            raise AssertionError("judge failed")
+    full = eval_compute(sid3, ev9["eval_id"], sug9, k=10).json()
+    ok = (
+        span_mid <= span_before + 1e-9
+        and full["n_unjudged"] == 0
+        and abs(full["bounds"]["lower"] - full["bounds"]["upper"]) < 1e-9
+        and abs(full["bounds"]["lower"] - full["tentative"]["delta"]) < 1e-9
+    )
+    failures += 0 if ok else 1
+    record(
+        "S9 标注收窄区间 & 全判定后界收敛", ok,
+        f"区间宽 {span_before:.4f} →（判 12 篇）{span_mid:.4f} →"
+        f"（判全部 40 篇）{full['bounds']['upper'] - full['bounds']['lower']:.6f}；"
+        f"全判定后 Δ={full['bounds']['lower']:.4f}；"
+        f"确定改善={full['bounds']['certain_improvement']}",
+        payload=full,
+    )
+
+    # --------------------------------------------------------------- S10
+    # 修订 → 评测结论撤下（旧建议 409），本批标注保留供新建议使用
+    eval_judge(sid3, ev9["eval_id"], ev9["docs"][0]["id"], True)
+    client.post("/api/revise", json={
+        "session_id": sid3, "exclude": [a3["expanded_terms"][0]],
+    })
+    stale_eval = eval_compute(sid3, ev9["eval_id"], sug9, k=10)
+    a3b = analyze(sid3)  # 新建议
+    kept = eval_compute(sid3, ev9["eval_id"], a3b["suggestion_id"], k=10)
+    ok = (
+        stale_eval.status_code == 409
+        and kept.status_code == 200
+        and kept.json()["n_judged"] == 40  # 标注全部保留
+    )
+    failures += 0 if ok else 1
+    record(
+        "S10 修订使评测结论失效（409）但标注保留", ok,
+        f"旧建议 compute HTTP={stale_eval.status_code}；"
+        f"新建议 rev={a3b['revision']} 可计算；"
+        f"保留标注数={kept.json()['n_judged'] if kept.status_code == 200 else 'N/A'}",
+        payload={"stale": stale_eval.json(), "fresh_rev": a3b["revision"]},
+    )
+
+    # --------------------------------------------------------------- S11
+    # 更换评测集 → 重新标注；迟到的旧 eval_id 请求不得恢复旧结论
+    ev11 = upload_eval(sid3)
+    old_eval_id = ev9["eval_id"]
+    late_compute = eval_compute(sid3, old_eval_id, a3b["suggestion_id"], k=10)
+    late_judge = eval_judge(sid3, old_eval_id, "E001", True)
+    fresh = eval_compute(sid3, ev11["eval_id"], a3b["suggestion_id"], k=10)
+    ok = (
+        ev11["annotations"] == {}
+        and late_compute.status_code == 409
+        and late_judge.status_code == 409
+        and fresh.status_code == 200
+        and fresh.json()["n_unjudged"] == 40
+    )
+    failures += 0 if ok else 1
+    record(
+        "S11 更换评测集后重新标注 & 迟到请求被拒", ok,
+        f"新批次标注数={len(ev11['annotations'])}；"
+        f"旧 eval_id compute HTTP={late_compute.status_code}、"
+        f"judge HTTP={late_judge.status_code}；"
+        f"新批次 compute HTTP={fresh.status_code}",
+        payload={"late_compute": late_compute.json()},
+    )
+
+    write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures,
+                 eval_info={"s7": e7, "s8": (e8, lo_bf, hi_bf), "s9": full})
     print(f"\n{len(results) - failures}/{len(results)} scenarios passed.")
     return 1 if failures else 0
 
@@ -239,15 +441,17 @@ def _metrics_row(title: str, data: dict) -> str:
     )
 
 
-def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures) -> None:
+def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures,
+                 eval_info=None) -> None:
     REPORT_DIR.mkdir(exist_ok=True)
     path = REPORT_DIR / "selftest_report.md"
     lines: list[str] = []
-    lines.append("# 交付前自测报告（阈值冲突与修订场景）")
+    lines.append("# 交付前自测报告（阈值冲突、修订与评测场景）")
     lines.append("")
     lines.append(f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}")
     lines.append("- 语料：`data/demo_corpus.csv`（45 篇，正例 17 / 负例 28；"
                  "其中 2 篇正例只含文档级独有词，用于触发词表覆盖上限）")
+    lines.append("- 评测集：`data/demo_eval.csv`（40 篇未审摘要，无标签列）")
     lines.append("- 初始查询：`quantum error correction`")
     lines.append("- 方式：FastAPI TestClient 全栈在进程内调用，无外部网络")
     lines.append("")
@@ -298,6 +502,46 @@ def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures) -> None:
                  f"HTTP **{stale.status_code}**")
     lines.append(f"- 响应内容：`{stale.json().get('detail')}`")
     lines.append("")
+
+    if eval_info:
+        e7 = eval_info["s7"]
+        e8, lo_bf, hi_bf = eval_info["s8"]
+        full = eval_info["s9"]
+        b7 = e7["bounds"]
+        lines.append("## 评测实测（新批次 NDCG@K 差值界）")
+        lines.append("")
+        lines.append("### S7 演示评测集（40 篇全未判，K=10）")
+        lines.append("")
+        lines.append(f"- 原查询词：`{', '.join(e7['query_terms_original'])}`")
+        lines.append(f"- 扩展查询词：`{', '.join(e7['query_terms_expanded'])}`")
+        lines.append(f"- 原榜命中 top-{e7['k']}："
+                     f"{[r['id'] for r in e7['lists']['original']]}")
+        lines.append(f"- 扩展榜命中 top-{e7['k']}："
+                     f"{[r['id'] for r in e7['lists']['expanded']]}")
+        lines.append(f"- 差值界：**[{b7['lower']:.4f}, {b7['upper']:.4f}]**；"
+                     f"暂定差值（未判按不相关）{e7['tentative']['delta']:.4f}")
+        lines.append(f"- 达上界应判相关的未判论文："
+                     f"{[w['id'] for w in b7['upper_witness']]}")
+        lines.append(f"- 达下界应判相关的未判论文："
+                     f"{[w['id'] for w in b7['lower_witness']]}")
+        lines.append("")
+        lines.append("### S8 精确性对照（6 篇小集，K=3，2 篇已判）")
+        lines.append("")
+        lines.append(f"- API 界 = [{e8['bounds']['lower']:.6f}, "
+                     f"{e8['bounds']['upper']:.6f}]")
+        lines.append(f"- 穷举界 = [{lo_bf:.6f}, {hi_bf:.6f}]（2^4=16 种补全逐一计算）")
+        lines.append("")
+        lines.append("### S9 全部 40 篇判定后（界收敛）")
+        lines.append("")
+        lines.append(f"- 判定规则：标题含 (QEC) 判相关（{full['n_relevant_judged']} 篇），"
+                     f"其余不相关")
+        lines.append(f"- 收敛后 Δ = **{full['bounds']['lower']:.4f}**"
+                     f"（下界 == 上界 == 暂定值）；"
+                     f"确定改善={full['bounds']['certain_improvement']}；"
+                     f"暂定 NDCG：原榜 {full['tentative']['ndcg_original']:.4f} / "
+                     f"扩展榜 {full['tentative']['ndcg_expanded']:.4f}")
+        lines.append("")
+
     lines.append(f"## 结论：**{len(results) - failures}/{len(results)} 通过**")
     path.write_text("\n".join(lines), encoding="utf-8")
     print(f"\nreport written -> {path}")

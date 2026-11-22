@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from .engine import Corpus, RevisionError, ThresholdError
+from .evaluate import EvalBatch, EvalError
 
 
 @dataclass
@@ -18,7 +19,17 @@ class Session:
     revision: int = 0                       # bumped on every lock/exclude change
     last_suggestion_rev: int | None = None  # revision when analysis was run
     last_suggestion_id: str | None = None
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    # 当前建议的词表快照（原查询词 + 选中扩展词），评测端点据此取词；
+    # 修订锁定/排除词时随建议一起作废
+    last_analysis_terms: dict | None = None
+    # 当前评测批次（未审摘要集 + 本批标注）；建议失效不影响本批标注，
+    # 重新上传评测集才会开启新批次并清空标注
+    eval_batch: EvalBatch | None = None
+    # RLock：评测端点需在同一临界区内做「批次校验 + 建议校验 + 计算」，
+    # 内部辅助方法（ensure_fresh / current_eval_batch）会嵌套获取同一把锁
+    lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
 
 
 class SessionStore:
@@ -97,14 +108,17 @@ class SessionStore:
                 # invalidated by the revision change, not merely mismatched
                 session.last_suggestion_id = None
                 session.last_suggestion_rev = None
+                session.last_analysis_terms = None
             return session
 
-    def bind_suggestion(self, session: Session) -> tuple[str, int]:
+    def bind_suggestion(self, session: Session,
+                        analysis_terms: dict | None = None) -> tuple[str, int]:
         """Record a fresh suggestion against the current revision."""
         with session.lock:
             suggestion_id = uuid.uuid4().hex
             session.last_suggestion_id = suggestion_id
             session.last_suggestion_rev = session.revision
+            session.last_analysis_terms = analysis_terms
             return suggestion_id, session.revision
 
     def ensure_fresh(self, session: Session, suggestion_id: str | None) -> None:
@@ -125,6 +139,40 @@ class SessionStore:
                     "该建议已失效：自建议生成以来锁定/排除词发生过修改，"
                     "旧建议不再有效，请重新分析以获取新建议。"
                 )
+
+    # -- evaluation batch operations -------------------------------------- #
+    def set_eval_batch(self, session_id: str, batch: EvalBatch) -> Session:
+        """Replace the eval batch: a new batch always starts unjudged."""
+        session = self.get(session_id)
+        with session.lock:
+            session.eval_batch = batch
+        return session
+
+    def current_eval_batch(self, session: Session,
+                           eval_id: str) -> EvalBatch:
+        """Return the live eval batch, rejecting ids of replaced batches.
+
+        A late request carrying an old ``eval_id`` must not resurrect
+        conclusions (or annotations) of a batch the user already replaced.
+        """
+        with session.lock:
+            batch = session.eval_batch
+            if batch is None:
+                raise EvalError("尚未上传评测集，请先上传未审摘要 CSV。")
+            if batch.eval_id != eval_id:
+                raise RevisionError(
+                    "评测集已更换：该请求来自旧批次，已拒绝；"
+                    "请基于当前评测集重新标注与计算。"
+                )
+            return batch
+
+    def judge_eval(self, session: Session, eval_id: str,
+                   doc_id: str, relevant: bool | None) -> EvalBatch:
+        # 校验与修改在同一临界区，避免与换批/计算交错
+        with session.lock:
+            batch = self.current_eval_batch(session, eval_id)
+            batch.judge(doc_id, relevant)
+            return batch
 
 
 store = SessionStore()

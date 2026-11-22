@@ -97,6 +97,7 @@ function bootstrapSession(data) {
   $("query-card").classList.remove("hidden");
   $("terms-card").classList.add("hidden");
   $("result-card").classList.add("hidden");
+  resetEvalState();
   updateRevisionBadge();
 }
 
@@ -140,6 +141,7 @@ async function runAnalysis() {
       // 旧建议已失效：清除本地建议 ID，提示用户重新分析
       state.suggestionId = null;
       state.suggestionRev = null;
+      withdrawEvalConclusions();
       showError(
         $("query-error"),
         "⚠ 旧建议已失效（修订后未重新分析）。\n" + err.message +
@@ -244,6 +246,8 @@ async function revise(patch) {
     // 修订即旧建议作废
     state.suggestionId = null;
     state.suggestionRev = null;
+    // 建议失效：立即撤下评测结论（本批标注保留，新建议出来后自动重算）
+    withdrawEvalConclusions();
     updateRevisionBadge();
     renderChips();
     if (state.lastResult) renderTerms(state.lastResult);
@@ -370,6 +374,10 @@ function renderResult(data) {
       <td>${doc.score.toFixed(4)}</td>`;
     rankBody.appendChild(tr);
   }
+
+  // 评测入口随分析结果开放；若已载入评测集，用当前建议自动重算差值界
+  $("eval-card").classList.remove("hidden");
+  if (evalState.evalId) computeEval();
 }
 
 function metric(k, v, cls) {
@@ -380,3 +388,289 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 function truncate(s, n) { return s.length > n ? s.slice(0, n) + "…" : s; }
+
+/* ------------------------------------------------------------------ */
+/* ⑤ 新批次评测：NDCG@K 差值上下界                                      */
+/* ------------------------------------------------------------------ */
+const evalState = {
+  evalId: null,
+  docs: [],            // [{id, title, abstract}]
+  annotations: {},     // doc_id -> true | false（两榜共用同一份标注）
+  result: null,        // 最近一次 eval-compute 响应
+  epoch: 0,            // 单调递增：迟到响应若 epoch 过期直接丢弃
+  withdrawn: false,    // 建议失效后结论已撤下（标注保留）
+};
+
+function resetEvalState() {
+  evalState.evalId = null;
+  evalState.docs = [];
+  evalState.annotations = {};
+  evalState.result = null;
+  evalState.withdrawn = false;
+  evalState.epoch++;                 // 使全部在途评测响应失效
+  $("eval-card").classList.add("hidden");
+  $("eval-body").classList.add("hidden");
+  setStatus($("eval-status"), "", "");
+  hideError($("eval-error"));
+}
+
+function fmtBound(x) {
+  const v = Math.abs(x) < 5e-5 ? 0 : x;   // 避免显示 “-0.0000”
+  return (v > 0 ? "+" : "") + v.toFixed(4);
+}
+
+/* ---- 上传评测集 ---- */
+$("eval-upload-btn").addEventListener("click", () => {
+  const file = $("eval-file-input").files[0];
+  if (!file) { setStatus($("eval-status"), "请先选择评测集 CSV 文件。", "err"); return; }
+  uploadEvalSet(file);
+});
+
+$("eval-demo-btn").addEventListener("click", async () => {
+  setStatus($("eval-status"), "加载演示评测集…", "");
+  hideError($("eval-error"));
+  try {
+    const text = await fetch("/api/demo-eval").then((r) => {
+      if (!r.ok) throw new Error("演示评测集不可用");
+      return r.text();
+    });
+    await uploadEvalSet(new File([text], "demo_eval.csv", { type: "text/csv" }));
+  } catch (err) {
+    setStatus($("eval-status"), "演示评测集加载失败：" + err.message, "err");
+  }
+});
+
+async function uploadEvalSet(file) {
+  if (!state.sessionId) return;
+  const epoch = ++evalState.epoch;   // 新批次：旧批次在途结果一律作废
+  const fd = new FormData();
+  fd.append("file", file);
+  setStatus($("eval-status"), "上传评测集…", "");
+  hideError($("eval-error"));
+  try {
+    const data = await api(`/api/sessions/${state.sessionId}/eval-set`, {
+      method: "POST", body: fd,
+    });
+    if (epoch !== evalState.epoch) return;          // 迟到结果丢弃
+    evalState.evalId = data.eval_id;
+    evalState.docs = data.docs;
+    evalState.annotations = {};                     // 换评测集 → 重新标注
+    evalState.result = null;
+    evalState.withdrawn = false;
+    $("eval-body").classList.remove("hidden");
+    renderEvalDocs();
+    clearEvalConclusions("新评测集已载入，请重新标注；正在计算差值界…");
+    setStatus($("eval-status"), data.message, "ok");
+    await computeEval(epoch);
+  } catch (err) {
+    if (epoch !== evalState.epoch) return;
+    setStatus($("eval-status"), "", "");
+    showError($("eval-error"), "评测集上传失败：" + err.message);
+  }
+}
+
+/* ---- 标注（可更正；两榜共用） ---- */
+async function judgeEvalDoc(docId, relevant) {   // relevant: true | false | null
+  if (!evalState.evalId) return;
+  const epoch = ++evalState.epoch;
+  hideError($("eval-error"));
+  try {
+    const data = await api(`/api/sessions/${state.sessionId}/eval-judge`, {
+      method: "POST",
+      body: JSON.stringify({ eval_id: evalState.evalId, doc_id: docId, relevant }),
+    });
+    if (epoch !== evalState.epoch) return;          // 迟到结果丢弃
+    evalState.annotations = data.annotations;
+    renderEvalDocs();
+    await computeEval(epoch);                       // 改标后重算
+  } catch (err) {
+    if (epoch !== evalState.epoch) return;
+    showError($("eval-error"), "⚠ " + err.message);
+  }
+}
+
+/* ---- 计算差值界 ---- */
+$("eval-compute-btn").addEventListener("click", () => computeEval());
+$("eval-k").addEventListener("change", () => computeEval());
+
+async function computeEval(epoch) {
+  if (!evalState.evalId || !state.suggestionId) return;
+  if (epoch === undefined) epoch = ++evalState.epoch;
+  const k = parseInt($("eval-k").value, 10);
+  if (!Number.isInteger(k) || k < 1 || k > 20) {
+    showError($("eval-error"), "K 必须是 1～20 的整数。");
+    return;
+  }
+  hideError($("eval-error"));
+  try {
+    const data = await api(`/api/sessions/${state.sessionId}/eval-compute`, {
+      method: "POST",
+      body: JSON.stringify({
+        eval_id: evalState.evalId,
+        suggestion_id: state.suggestionId,
+        k,
+      }),
+    });
+    if (epoch !== evalState.epoch) return;          // 迟到结果不得恢复旧结论
+    evalState.result = data;
+    evalState.withdrawn = false;
+    renderEvalResult(data);
+  } catch (err) {
+    if (epoch !== evalState.epoch) return;
+    if (err.status === 409) {
+      // 建议失效 / 批次已换：撤下结论，本批标注保留
+      evalState.result = null;
+      evalState.withdrawn = true;
+      clearEvalConclusions("⚠ " + err.message + "（本批标注已保留）");
+    } else {
+      showError($("eval-error"), err.message);
+    }
+  }
+}
+
+/* 建议失效时：立即撤下结论（标注保留，等新建议重算） */
+function withdrawEvalConclusions(note) {
+  if (!evalState.evalId) return;
+  evalState.epoch++;                 // 在途评测响应全部作废
+  evalState.result = null;
+  evalState.withdrawn = true;
+  clearEvalConclusions(note || "建议已失效，评测结论已撤下；本批标注已保留，等待新建议重算。");
+}
+
+function clearEvalConclusions(note) {
+  const v = $("eval-verdict");
+  v.className = "verdict withdrawn";
+  v.textContent = note;
+  $("eval-metrics").innerHTML = "";
+  $("eval-witness").innerHTML = "";
+  for (const id of ["eval-list-a", "eval-list-b"]) {
+    $(id).querySelector("tbody").innerHTML = "";
+  }
+  $("eval-lists-meta").textContent = "（暂无有效结论）";
+}
+
+/* ---- 渲染 ---- */
+function judgmentTag(j) {
+  if (j === true) return '<span class="tag rel">相关</span>';
+  if (j === false) return '<span class="tag nonrel">不相关</span>';
+  return '<span class="tag unjudged">未判</span>';
+}
+
+function judgeButtons(docId) {
+  const wrap = document.createElement("span");
+  wrap.className = "judge-btns";
+  const cur = evalState.annotations[docId];
+  const mk = (label, val, onCls) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (cur === val) b.classList.add(onCls);
+    b.onclick = () => judgeEvalDoc(docId, val);
+    return b;
+  };
+  const clr = document.createElement("button");
+  clr.textContent = "撤销";
+  clr.title = "撤销判定，回到未审";
+  clr.onclick = () => judgeEvalDoc(docId, null);
+  wrap.append(mk("相关", true, "on-rel"), mk("不相关", false, "on-nonrel"), clr);
+  return wrap;
+}
+
+function renderEvalDocs() {
+  const tbody = $("eval-docs-table").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const doc of evalState.docs) {
+    const tr = document.createElement("tr");
+    const j = evalState.annotations[doc.id];
+    tr.innerHTML = `
+      <td>${escapeHtml(doc.id)}</td>
+      <td><strong>${escapeHtml(doc.title)}</strong><br/>
+          <span class="hint">${escapeHtml(truncate(doc.abstract, 160))}</span></td>
+      <td class="jcell"></td>
+      <td class="bcell"></td>`;
+    tr.querySelector(".jcell").innerHTML = judgmentTag(j === undefined ? null : j);
+    tr.querySelector(".bcell").appendChild(judgeButtons(doc.id));
+    tbody.appendChild(tr);
+  }
+  const nJudged = Object.keys(evalState.annotations).length;
+  const nRel = Object.values(evalState.annotations).filter(Boolean).length;
+  $("eval-judge-meta").textContent =
+    `（共 ${evalState.docs.length} 篇，已判 ${nJudged}：相关 ${nRel} / 不相关 ${nJudged - nRel}；` +
+    "判定可更正，两榜共用同一份标注）";
+}
+
+function renderEvalList(tableId, rows) {
+  const tbody = $(tableId).querySelector("tbody");
+  tbody.innerHTML = "";
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="hint">（该查询在评测集上无命中）</td></tr>';
+    return;
+  }
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${row.rank}</td>
+      <td>${escapeHtml(row.id)}</td>
+      <td><strong>${escapeHtml(row.title)}</strong><br/>
+          <span class="hint">相似度 ${row.score.toFixed(4)}｜命中词：${row.matched_terms.map(escapeHtml).join(", ")}</span></td>
+      <td class="jcell"></td>`;
+    tr.querySelector(".jcell").innerHTML = judgmentTag(row.judgment === undefined ? null : row.judgment);
+    tbody.appendChild(tr);
+  }
+}
+
+function witnessHtml(list) {
+  if (list.length === 0) return "（无 —— 未判论文全部判不相关即达到该端点）";
+  const shown = list.slice(0, 30)
+    .map((x) => `<code>${escapeHtml(x.id)}</code>`).join(" ");
+  return shown + (list.length > 30 ? ` …等 ${list.length} 篇` : "");
+}
+
+function renderEvalResult(data) {
+  $("eval-body").classList.remove("hidden");
+  const b = data.bounds;
+  const t = data.tentative;
+  const v = $("eval-verdict");
+  if (b.certain_improvement) {
+    v.className = "verdict improve";
+    v.textContent = `✅ 确定改善：无论剩余 ${data.n_unjudged} 篇未判论文如何判定，` +
+      `扩展榜 NDCG@${data.k} 都严格高于原榜（差值下界 ${fmtBound(b.lower)} > 0）。`;
+  } else if (b.certain_regression) {
+    v.className = "verdict regress";
+    v.textContent = `❌ 确定变差：无论剩余 ${data.n_unjudged} 篇未判论文如何判定，` +
+      `扩展榜都不优于原榜（差值上界 ${fmtBound(b.upper)} < 0）。`;
+  } else if (Math.abs(b.upper - b.lower) < 1e-9) {
+    v.className = "verdict neutral";
+    v.textContent = `ℹ️ 差值已收敛为一点：Δ = ${fmtBound(b.lower)}；` +
+      "下界未大于 0，不能判定确定改善。";
+  } else {
+    v.className = "verdict uncertain";
+    v.textContent = `⏳ 尚不确定：差值 ∈ [${fmtBound(b.lower)}, ${fmtBound(b.upper)}]；` +
+      `继续标注剩余 ${data.n_unjudged} 篇未判论文可收窄区间，下界 > 0 才能判定确定改善。`;
+  }
+  $("eval-metrics").innerHTML = [
+    metric("差值下界", fmtBound(b.lower), b.lower > 0 ? "good" : ""),
+    metric("差值上界", fmtBound(b.upper), b.upper < 0 ? "bad" : ""),
+    metric("暂定差值（未判按不相关）", fmtBound(t.delta)),
+    metric("暂定 NDCG · 原榜", t.ndcg_original.toFixed(4)),
+    metric("暂定 NDCG · 扩展榜", t.ndcg_expanded.toFixed(4)),
+    metric("已判 / 未判", `${data.n_judged} / ${data.n_unjudged}`),
+  ].join("");
+  $("eval-witness").innerHTML = `
+    <div class="witness-box">
+      <h4>达到上界 ${fmtBound(b.upper)} 时：应判相关的未判论文</h4>
+      <p class="hint">${witnessHtml(b.upper_witness)}（其余未判论文判不相关）</p>
+      <h4>达到下界 ${fmtBound(b.lower)} 时：应判相关的未判论文</h4>
+      <p class="hint">${witnessHtml(b.lower_witness)}（其余未判论文判不相关）</p>
+    </div>`;
+  $("eval-list-a-title").textContent =
+    `原查询 top-${data.k}（${data.query_terms_original.join(", ") || "无有效词"}）`;
+  $("eval-list-b-title").textContent =
+    `扩展查询 top-${data.k}（${data.query_terms_expanded.join(", ") || "无有效词"}）`;
+  renderEvalList("eval-list-a", data.lists.original);
+  renderEvalList("eval-list-b", data.lists.expanded);
+  $("eval-lists-meta").textContent =
+    `（基于 rev=${data.revision} 的当前建议；评测集 ${data.n_docs} 篇，理想榜按全集计算）`;
+  // 标注表同步（compute 响应携带最新标注）
+  evalState.annotations = data.annotations;
+  renderEvalDocs();
+}
